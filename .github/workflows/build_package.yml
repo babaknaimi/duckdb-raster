@@ -54,7 +54,7 @@ jobs:
         shell: bash
 
       - name: Build extension
-        run: ninja -C build/release extension/geotiff/geotiff.duckdb_extension
+        run: ninja -C build/release extension/raster/raster.duckdb_extension
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
@@ -76,5 +76,5 @@ jobs:
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
-          name: geotiff-${{ matrix.os }}-${{ matrix.triplet }}
+          name: raster-${{ matrix.os }}-${{ matrix.triplet }}
           path: dist/**/*
