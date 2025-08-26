@@ -1,0 +1,16 @@
+# name: test/sql/raster.test
+# group: [sql]
+
+# group [raster]
+
+statement ok
+INSTALL raster FROM local_build_release;
+
+statement ok
+LOAD raster;
+
+
+query I
+SELECT COUNT(*) FROM read_raster('test/data/cea.tif', band := 1, target_mb := 32);
+----
+264710
