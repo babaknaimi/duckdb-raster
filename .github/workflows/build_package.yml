@@ -1,0 +1,15 @@
+name: Build & package raster
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      extension_name: raster
+      duckdb_version: main   # or pin to a stable tag that exists, e.g. v1.3.1
+      ci_tools_version: main # keep in sync with duckdb_version
+      exclude_archs: 'windows_amd64_mingw'
