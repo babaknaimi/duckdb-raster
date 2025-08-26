@@ -30,13 +30,14 @@ struct BindData : public FunctionData {
   // one or many bands
   std::vector<int> bands; // 1-based GDAL band indices
   idx_t target_mb = 64;   // per-refill read budget (MiB)
-  idx_t cache_mb = 0;     // optional: set GDAL global cache (MiB); 0 = don't touch
+  idx_t cache_mb = 0; // optional: set GDAL global cache (MiB); 0 = don't touch
   unique_ptr<FunctionData> Copy() const override {
     return make_uniq<BindData>(*this);
   }
   bool Equals(const FunctionData &o_p) const override {
     auto &o = o_p.Cast<BindData>();
-    return path == o.path && bands == o.bands && target_mb == o.target_mb && cache_mb == o.cache_mb;
+    return path == o.path && bands == o.bands && target_mb == o.target_mb &&
+           cache_mb == o.cache_mb;
   }
 };
 
@@ -52,18 +53,18 @@ struct GlobalState : public GlobalTableFunctionState {
 
   // block & buffering
   int bx = 0, by = 0;
-  idx_t buf_rows = 0;   // rows per refill
-  idx_t buf_pos_px = 0; // position within current buffer in pixels (not counting bands)
+  idx_t buf_rows = 0; // rows per refill
+  idx_t buf_pos_px =
+      0; // position within current buffer in pixels (not counting bands)
   idx_t buf_len_px = 0; // valid pixels currently buffered
   int64_t next_row = 0; // next dataset row to read
   int64_t buf_row0 = 0; // first row contained in current buffer
 
   std::vector<double>
-    buf; // layout = band-sequential planes: [b0_plane | b1_plane | ...], each plane size = width * rows_read
+      buf; // layout = band-sequential planes: [b0_plane | b1_plane | ...], each
+           // plane size = width * rows_read
 
-  idx_t MaxThreads() const override {
-    return 1;
-  } // single-threaded
+  idx_t MaxThreads() const override { return 1; } // single-threaded
 };
 
 static idx_t RoundUp(idx_t v, idx_t mul) {
@@ -76,8 +77,8 @@ static idx_t RoundUp(idx_t v, idx_t mul) {
 static void ParseBands(const Value &v, std::vector<int> &out) {
   // Accept either a single INTEGER or a LIST of INTEGERs
   const auto id = v.type().id();
-  if (id == LogicalTypeId::INTEGER || id == LogicalTypeId::BIGINT || id == LogicalTypeId::SMALLINT ||
-      id == LogicalTypeId::TINYINT) {
+  if (id == LogicalTypeId::INTEGER || id == LogicalTypeId::BIGINT ||
+      id == LogicalTypeId::SMALLINT || id == LogicalTypeId::TINYINT) {
     out.push_back(v.GetValue<int32_t>());
     return;
   }
@@ -88,15 +89,19 @@ static void ParseBands(const Value &v, std::vector<int> &out) {
       out.push_back(c.GetValue<int32_t>());
     return;
   }
-  throw BinderException("Parameter 'band' must be an INTEGER or a LIST of INTEGERs");
+  throw BinderException(
+      "Parameter 'band' must be an INTEGER or a LIST of INTEGERs");
 }
 
-// basic identifier sanitizer: [A-Za-z_][A-Za-z0-9_]*, collapse/replace others with '_'
-static std::string SanitizeIdentifier(const std::string &in, int band_index, bool allow_value_fallback) {
+// basic identifier sanitizer: [A-Za-z_][A-Za-z0-9_]*, collapse/replace others
+// with '_'
+static std::string SanitizeIdentifier(const std::string &in, int band_index,
+                                      bool allow_value_fallback) {
   std::string s;
   s.reserve(in.size());
   for (char c : in) {
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '_') {
       s.push_back(c);
     } else if (c == ' ') {
       s.push_back('_');
@@ -161,7 +166,8 @@ static std::string MakeSafeName(const std::string &in) {
   return out;
 }
 
-static std::vector<std::string> MakeUniqueNames(const std::vector<std::string> &in) {
+static std::vector<std::string>
+MakeUniqueNames(const std::vector<std::string> &in) {
   std::vector<std::string> out;
   out.reserve(in.size());
   std::unordered_map<std::string, int> seen;
@@ -189,8 +195,11 @@ static std::vector<std::string> MakeUniqueNames(const std::vector<std::string> &
   return out;
 }
 
-// ---- Bind: parse args & declare schema based on band descriptions (if present)
-static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+// ---- Bind: parse args & declare schema based on band descriptions (if
+// present)
+static unique_ptr<FunctionData> Bind(ClientContext &,
+                                     TableFunctionBindInput &input,
+                                     vector<LogicalType> &types,
                                      vector<string> &names) {
   if (input.inputs.empty())
     throw BinderException("read_raster(path, ...) requires a file path");
@@ -234,7 +243,8 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
 
   // Multi-band: fetch real band names from the dataset
   GDALAllRegister();
-  GDALDataset *raw = static_cast<GDALDataset *>(GDALOpen(bd->path.c_str(), GA_ReadOnly));
+  GDALDataset *raw =
+      static_cast<GDALDataset *>(GDALOpen(bd->path.c_str(), GA_ReadOnly));
   if (!raw) {
     throw IOException("GDALOpen failed for '%s'", bd->path.c_str());
   }
@@ -244,7 +254,8 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
   for (auto b : bd->bands) {
     if (b > band_count) {
       GDALClose(raw);
-      throw IOException("Requested band %d but file has only %d bands", b, band_count);
+      throw IOException("Requested band %d but file has only %d bands", b,
+                        band_count);
     }
   }
 
@@ -277,7 +288,8 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
 }
 
 // ---- Init: open dataset, set cache, choose buffer size
-static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &in) {
+static unique_ptr<GlobalTableFunctionState> Init(ClientContext &,
+                                                 TableFunctionInitInput &in) {
   auto &bd = in.bind_data->Cast<BindData>();
   auto st = make_uniq<GlobalState>();
 
@@ -286,7 +298,8 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
   }
 
   GDALAllRegister();
-  GDALDataset *raw = static_cast<GDALDataset *>(GDALOpen(bd.path.c_str(), GA_ReadOnly));
+  GDALDataset *raw =
+      static_cast<GDALDataset *>(GDALOpen(bd.path.c_str(), GA_ReadOnly));
   if (!raw)
     throw IOException("GDALOpen failed for '%s'", bd.path.c_str());
   st->ds.reset(raw);
@@ -299,7 +312,8 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
   st->bands = bd.bands;
   for (auto b : st->bands)
     if (b > band_count)
-      throw IOException("Requested band %d but file has only %d bands", b, band_count);
+      throw IOException("Requested band %d but file has only %d bands", b,
+                        band_count);
 
   // per-band nodata & natural block size
   st->nodata.resize(st->bands.size(), std::numeric_limits<double>::quiet_NaN());
@@ -320,7 +334,8 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
 
   // choose rows per refill so that (width * rows * bands * 8) ~= target_mb MiB
   const idx_t bytes_budget = (idx_t)bd.target_mb * 1024ull * 1024ull;
-  const idx_t denom = (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
+  const idx_t denom =
+      (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
   idx_t rows = std::max<idx_t>(1, bytes_budget / std::max<idx_t>(denom, 1));
   rows = RoundUp(rows, (idx_t)std::max<int>(1, st->by));
   rows = std::min<idx_t>(rows, (idx_t)st->height);
@@ -350,7 +365,8 @@ static void Refill(GlobalState &st) {
     return;
   }
   const int64_t max_rows = (int64_t)st.buf_rows;
-  const int64_t rows_to_read = std::min<int64_t>(max_rows, st.height - st.next_row);
+  const int64_t rows_to_read =
+      std::min<int64_t>(max_rows, st.height - st.next_row);
 
   const int nBands = (int)st.bands.size();
   const int nXSize = (int)st.width;
@@ -359,14 +375,16 @@ static void Refill(GlobalState &st) {
   // spacing for BSQ
   const GSpacing pixel_space = sizeof(double);
   const GSpacing line_space = (GSpacing)(sizeof(double) * (size_t)st.width);
-  const GSpacing band_space = (GSpacing)(sizeof(double) * (size_t)st.width * (size_t)rows_to_read);
+  const GSpacing band_space =
+      (GSpacing)(sizeof(double) * (size_t)st.width * (size_t)rows_to_read);
 
   CPLErr err = st.ds->RasterIO(GF_Read,
                                /*xoff,yoff*/ 0, (int)st.next_row,
                                /*xsize,ysize*/ nXSize, nYSize,
                                /*data*/ (void *)st.buf.data(),
                                /*buf_x,buf_y*/ nXSize, nYSize, GDT_Float64,
-                               /*bands*/ nBands, st.band_map.data(), pixel_space, line_space, band_space, nullptr);
+                               /*bands*/ nBands, st.band_map.data(),
+                               pixel_space, line_space, band_space, nullptr);
   if (err != CE_None) {
     throw IOException("RasterIO failed at row %lld", (long long)st.next_row);
   }
@@ -374,7 +392,8 @@ static void Refill(GlobalState &st) {
   st.buf_row0 = st.next_row;
   st.next_row += rows_to_read;
   st.buf_pos_px = 0;
-  st.buf_len_px = (idx_t)((int64_t)st.width * rows_to_read); // in pixels (per band)
+  st.buf_len_px =
+      (idx_t)((int64_t)st.width * rows_to_read); // in pixels (per band)
 }
 
 // ---- Scan: emit up to STANDARD_VECTOR_SIZE rows
