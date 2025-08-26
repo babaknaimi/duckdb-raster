@@ -1,8 +1,8 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Configuration of extension
-EXT_NAME=geotiff
+EXT_NAME=raster
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# Include the Makefile from extension-ci-tools
+# Include the Makefile from extension-ci-tools to build the extension using DuckDB CI tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile

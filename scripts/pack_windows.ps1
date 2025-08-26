@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$ext = "build\release\extension\geotiff\geotiff.duckdb_extension"
+# Location of the built extension
+$ext = "build\release\extension\raster\raster.duckdb_extension"
 $out = "dist\windows"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 Copy-Item $ext $out\

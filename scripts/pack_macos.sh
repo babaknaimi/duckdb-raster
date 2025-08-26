@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXT="build/release/extension/geotiff/geotiff.duckdb_extension"
+# Location of the built extension
+EXT="build/release/extension/raster/raster.duckdb_extension"
 OUTDIR="dist/macos"
 mkdir -p "$OUTDIR"
 cp "$EXT" "$OUTDIR/"
 
-# vcpkg dynamic libs live here on macOS:
+# vcpkg dynamic libs live here on macOS (arm64 triplet in CI)
 VCPKG_LIB_DIR="$(pwd)/build/release/vcpkg_installed/arm64-osx-dynamic/lib"
 
 # List extension's dylib deps, copy vcpkg ones beside it
 otool -L "$EXT" | awk '{print $1}' | while read -r dep; do
   case "$dep" in
-    *libgdal*.dylib|*libproj*.dylib|*libgeos*.dylib|*libcurl*.dylib|*libz*.dylib|*libtiff*.dylib|*libjpeg*.dylib|*libpng*.dylib|*libwebp*.dylib|*libexpat*.dylib|*libxml2*.dylib)
+    *libgdal*.dylib|*libproj*.dylib|*libgeos*.dylib|*libcurl*.dylib|*libz*.dylib|*libtiff*.dylib|
+    *libjpeg*.dylib|*libpng*.dylib|*libwebp*.dylib|*libexpat*.dylib|*libxml2*.dylib)
       base="$(basename "$dep")"
       if [ -f "$VCPKG_LIB_DIR/$base" ]; then
         cp -n "$VCPKG_LIB_DIR/$base" "$OUTDIR/"
