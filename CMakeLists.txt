@@ -7,8 +7,10 @@ if(NOT COMMAND build_loadable_extension)
 endif()
 
 set(EXT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+
 set(EXTENSION_SOURCES
   "${EXT_ROOT}/src/raster.cpp"
+  "${EXT_ROOT}/src/raster_functions.cpp"
   # Uncomment if you also build the static-in-CLI flavor:
   # "${EXT_ROOT}/src/raster_extension.cpp"
 )

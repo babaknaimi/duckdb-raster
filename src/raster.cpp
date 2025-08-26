@@ -16,6 +16,13 @@
 
 using namespace duckdb;
 
+// The implementation of the `read_raster` table function below is largely
+// derived from the original GeoTIFF extension.  It relies on GDAL to open
+// arbitrary raster datasets and streams pixels into a DuckDB table.  The
+// function supports reading one or many bands simultaneously.  To extend
+// functionality beyond reading (e.g. metadata and simple statistics), see
+// raster_functions.cpp, which registers additional scalar functions.
+
 namespace {
 
 struct BindData : public FunctionData {
@@ -42,7 +49,7 @@ struct GlobalState : public GlobalTableFunctionState {
   std::vector<int> band_map;    // same as bands, cached as int*
   std::vector<double> nodata;   // per-band nodata
   std::vector<bool> has_nodata; // per-band nodata flag
-  
+
   // block & buffering
   int bx = 0, by = 0;
   idx_t buf_rows = 0;   // rows per refill
@@ -50,10 +57,10 @@ struct GlobalState : public GlobalTableFunctionState {
   idx_t buf_len_px = 0; // valid pixels currently buffered
   int64_t next_row = 0; // next dataset row to read
   int64_t buf_row0 = 0; // first row contained in current buffer
-  
+
   std::vector<double>
     buf; // layout = band-sequential planes: [b0_plane | b1_plane | ...], each plane size = width * rows_read
-  
+
   idx_t MaxThreads() const override {
     return 1;
   } // single-threaded
@@ -131,24 +138,24 @@ static void MakeUnique(std::vector<std::string> &names) {
 static std::string MakeSafeName(const std::string &in) {
   std::string out;
   out.reserve(in.size() + 1);
-  
+
   auto to_valid = [](unsigned char ch) -> char {
     if (std::isalnum(ch) || ch == '_')
       return (char)ch;
     return '_';
   };
-  
+
   // convert each char; replace disallowed with '_'
   for (size_t i = 0; i < in.size(); ++i) {
     out.push_back(to_valid((unsigned char)in[i]));
   }
-  
+
   // trim leading underscores/digits issues
   if (out.empty())
     out = "_";
   if (std::isdigit((unsigned char)out[0]))
     out.insert(out.begin(), '_');
-  
+
   // collapse multiple underscores (optional)
   // (kept simple; DuckDB accepts consecutive underscores)
   return out;
@@ -187,10 +194,10 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
                                      vector<string> &names) {
   if (input.inputs.empty())
     throw BinderException("read_raster(path, ...) requires a file path");
-  
+
   auto bd = make_uniq<BindData>();
   bd->path = StringValue::Get(input.inputs[0]);
-  
+
   // Parse 'band' (scalar or LIST). Default [1].
   bd->bands.clear();
   auto it = input.named_parameters.find("band");
@@ -203,7 +210,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
     if (b < 1)
       throw BinderException("band indices must be >= 1");
   }
-  
+
   // Optional tuning
   it = input.named_parameters.find("target_mb");
   if (it != input.named_parameters.end())
@@ -211,27 +218,27 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
   it = input.named_parameters.find("cache_mb");
   if (it != input.named_parameters.end())
     bd->cache_mb = (idx_t)it->second.GetValue<int32_t>();
-  
+
   // Output schema
   types.clear();
   names.clear();
   types.push_back(LogicalType::BIGINT);
   names.push_back("cell_id");
-  
+
   if (bd->bands.size() == 1u) {
     // single-band: keep legacy column name for compatibility
     types.push_back(LogicalType::DOUBLE);
     names.push_back("value");
     return std::move(bd);
   }
-  
+
   // Multi-band: fetch real band names from the dataset
   GDALAllRegister();
   GDALDataset *raw = static_cast<GDALDataset *>(GDALOpen(bd->path.c_str(), GA_ReadOnly));
   if (!raw) {
     throw IOException("GDALOpen failed for '%s'", bd->path.c_str());
   }
-  
+
   const int band_count = raw->GetRasterCount();
   // Validate requested bands vs. file
   for (auto b : bd->bands) {
@@ -240,7 +247,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
       throw IOException("Requested band %d but file has only %d bands", b, band_count);
     }
   }
-  
+
   // Collect candidate names (description -> sanitize -> fallback)
   std::vector<std::string> cols;
   cols.reserve(bd->bands.size());
@@ -258,10 +265,10 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
     cols.push_back(nm);
   }
   GDALClose(raw);
-  
+
   // Ensure uniqueness (append _2, _3, ...)
   cols = MakeUniqueNames(cols);
-  
+
   for (auto &c : cols) {
     types.push_back(LogicalType::DOUBLE);
     names.push_back(c);
@@ -273,67 +280,67 @@ static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &in
 static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &in) {
   auto &bd = in.bind_data->Cast<BindData>();
   auto st = make_uniq<GlobalState>();
-  
+
   if (bd.cache_mb > 0) {
     CPLSetConfigOption("GDAL_CACHEMAX", std::to_string(bd.cache_mb).c_str());
   }
-  
+
   GDALAllRegister();
   GDALDataset *raw = static_cast<GDALDataset *>(GDALOpen(bd.path.c_str(), GA_ReadOnly));
   if (!raw)
     throw IOException("GDALOpen failed for '%s'", bd.path.c_str());
   st->ds.reset(raw);
-  
+
   st->width = raw->GetRasterXSize();
   st->height = raw->GetRasterYSize();
-  
+
   // Validate bands against dataset (again, cheap)
   const int band_count = raw->GetRasterCount();
   st->bands = bd.bands;
   for (auto b : st->bands)
     if (b > band_count)
       throw IOException("Requested band %d but file has only %d bands", b, band_count);
-    
-    // per-band nodata & natural block size
-    st->nodata.resize(st->bands.size(), std::numeric_limits<double>::quiet_NaN());
-    st->has_nodata.resize(st->bands.size(), false);
-    
-    int bxs = 0, bys = 0;
-    for (size_t i = 0; i < st->bands.size(); ++i) {
-      auto *rb = raw->GetRasterBand(st->bands[i]);
-      int has_nd = 0;
-      double nd = rb->GetNoDataValue(&has_nd);
-      st->nodata[i] = nd;
-      st->has_nodata[i] = (has_nd != 0);
-      if (i == 0)
-        rb->GetBlockSize(&bxs, &bys);
-    }
-    st->bx = bxs > 0 ? bxs : (int)st->width;
-    st->by = bys > 0 ? bys : 1;
-    
-    // choose rows per refill so that (width * rows * bands * 8) ~= target_mb MiB
-    const idx_t bytes_budget = (idx_t)bd.target_mb * 1024ull * 1024ull;
-    const idx_t denom = (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
-    idx_t rows = std::max<idx_t>(1, bytes_budget / std::max<idx_t>(denom, 1));
-    rows = RoundUp(rows, (idx_t)std::max(1, st->by));
-    rows = std::min<idx_t>(rows, (idx_t)st->height);
-    
-    // allocate buffer (one plane per band)
-    st->buf_rows = rows;
-    const idx_t plane_px = (idx_t)st->width * st->buf_rows;
-    const idx_t total_px = plane_px * (idx_t)st->bands.size();
-    st->buf.assign((size_t)total_px, 0.0);
-    
-    // band map (GDAL wants int*)
-    st->band_map.resize(st->bands.size());
-    for (size_t i = 0; i < st->bands.size(); ++i)
-      st->band_map[i] = st->bands[i];
-    
-    st->buf_pos_px = 0;
-    st->buf_len_px = 0;
-    st->next_row = 0;
-    st->buf_row0 = 0;
-    return std::move(st);
+
+  // per-band nodata & natural block size
+  st->nodata.resize(st->bands.size(), std::numeric_limits<double>::quiet_NaN());
+  st->has_nodata.resize(st->bands.size(), false);
+
+  int bxs = 0, bys = 0;
+  for (size_t i = 0; i < st->bands.size(); ++i) {
+    auto *rb = raw->GetRasterBand(st->bands[i]);
+    int has_nd = 0;
+    double nd = rb->GetNoDataValue(&has_nd);
+    st->nodata[i] = nd;
+    st->has_nodata[i] = (has_nd != 0);
+    if (i == 0)
+      rb->GetBlockSize(&bxs, &bys);
+  }
+  st->bx = bxs > 0 ? bxs : (int)st->width;
+  st->by = bys > 0 ? bys : 1;
+
+  // choose rows per refill so that (width * rows * bands * 8) ~= target_mb MiB
+  const idx_t bytes_budget = (idx_t)bd.target_mb * 1024ull * 1024ull;
+  const idx_t denom = (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
+  idx_t rows = std::max<idx_t>(1, bytes_budget / std::max<idx_t>(denom, 1));
+  rows = RoundUp(rows, (idx_t)std::max<int>(1, st->by));
+  rows = std::min<idx_t>(rows, (idx_t)st->height);
+
+  // allocate buffer (one plane per band)
+  st->buf_rows = rows;
+  const idx_t plane_px = (idx_t)st->width * st->buf_rows;
+  const idx_t total_px = plane_px * (idx_t)st->bands.size();
+  st->buf.assign((size_t)total_px, 0.0);
+
+  // band map (GDAL wants int*)
+  st->band_map.resize(st->bands.size());
+  for (size_t i = 0; i < st->bands.size(); ++i)
+    st->band_map[i] = st->bands[i];
+
+  st->buf_pos_px = 0;
+  st->buf_len_px = 0;
+  st->next_row = 0;
+  st->buf_row0 = 0;
+  return std::move(st);
 }
 
 // ---- Refill: one multi-band RasterIO into band-sequential planes
@@ -344,36 +351,36 @@ static void Refill(GlobalState &st) {
   }
   const int64_t max_rows = (int64_t)st.buf_rows;
   const int64_t rows_to_read = std::min<int64_t>(max_rows, st.height - st.next_row);
-  
+
   const int nBands = (int)st.bands.size();
   const int nXSize = (int)st.width;
   const int nYSize = (int)rows_to_read;
-  
+
   // spacing for BSQ
   const GSpacing pixel_space = sizeof(double);
   const GSpacing line_space = (GSpacing)(sizeof(double) * (size_t)st.width);
   const GSpacing band_space = (GSpacing)(sizeof(double) * (size_t)st.width * (size_t)rows_to_read);
-  
+
   CPLErr err = st.ds->RasterIO(GF_Read,
                                /*xoff,yoff*/ 0, (int)st.next_row,
                                /*xsize,ysize*/ nXSize, nYSize,
                                /*data*/ (void *)st.buf.data(),
                                /*buf_x,buf_y*/ nXSize, nYSize, GDT_Float64,
                                /*bands*/ nBands, st.band_map.data(), pixel_space, line_space, band_space, nullptr);
-                               if (err != CE_None) {
-                                 throw IOException("RasterIO failed at row %lld", (long long)st.next_row);
-                               }
-                               
-                               st.buf_row0 = st.next_row;
-                               st.next_row += rows_to_read;
-                               st.buf_pos_px = 0;
-                               st.buf_len_px = (idx_t)((int64_t)st.width * rows_to_read); // in pixels (per band)
+  if (err != CE_None) {
+    throw IOException("RasterIO failed at row %lld", (long long)st.next_row);
+  }
+
+  st.buf_row0 = st.next_row;
+  st.next_row += rows_to_read;
+  st.buf_pos_px = 0;
+  st.buf_len_px = (idx_t)((int64_t)st.width * rows_to_read); // in pixels (per band)
 }
 
 // ---- Scan: emit up to STANDARD_VECTOR_SIZE rows
 static void Scan(ClientContext &, TableFunctionInput &in, DataChunk &out) {
   auto &st = in.global_state->Cast<GlobalState>();
-  
+
   if (st.buf_pos_px >= st.buf_len_px) {
     Refill(st);
     if (st.buf_len_px == 0) {
@@ -381,17 +388,17 @@ static void Scan(ClientContext &, TableFunctionInput &in, DataChunk &out) {
       return;
     }
   }
-  
+
   const idx_t remaining = st.buf_len_px - st.buf_pos_px;
   const idx_t to_emit = std::min<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-  
+
   auto *id = FlatVector::GetData<int64_t>(out.data[0]);
   const int64_t cell0 = st.buf_row0 * st.width;
-  
+
   // Fill cell_id
   for (idx_t i = 0; i < to_emit; i++)
     id[i] = cell0 + (int64_t)st.buf_pos_px + (int64_t)i;
-  
+
   const size_t nBands = st.bands.size();
   if (nBands == 1) {
     auto *val = FlatVector::GetData<double>(out.data[1]);
@@ -416,7 +423,7 @@ static void Scan(ClientContext &, TableFunctionInput &in, DataChunk &out) {
       auto *col = FlatVector::GetData<double>(out.data[1 + j]);
       auto &vbit = FlatVector::Validity(out.data[1 + j]);
       const double *src = st.buf.data() + (idx_t)j * plane_size + st.buf_pos_px;
-      
+
       if (!st.has_nodata[j]) {
         std::memcpy(col, src, sizeof(double) * to_emit);
         vbit.SetAllValid(to_emit);
@@ -433,7 +440,7 @@ static void Scan(ClientContext &, TableFunctionInput &in, DataChunk &out) {
       }
     }
   }
-  
+
   st.buf_pos_px += to_emit;
   out.SetCardinality(to_emit);
 }
@@ -448,17 +455,20 @@ void RegisterRaster(DatabaseInstance &db) {
   tf.named_parameters["target_mb"] = LogicalType::INTEGER;
   tf.named_parameters["cache_mb"] = LogicalType::INTEGER; // optional
   ExtensionUtil::RegisterFunction(db, tf);
+
+  // Register additional scalar functions (width/height/statistics)
+  RegisterRasterFunctions(db);
 }
 } // namespace duckdb
 
 extern "C" {
-  
-  DUCKDB_EXTENSION_API void raster_init(duckdb::DatabaseInstance &db) {
-    duckdb::RegisterRaster(db);
-  }
-  
-  DUCKDB_EXTENSION_API const char *raster_version() {
-    return duckdb::DuckDB::LibraryVersion();
-  }
-  
+
+DUCKDB_EXTENSION_API void raster_init(duckdb::DatabaseInstance &db) {
+  duckdb::RegisterRaster(db);
+}
+
+DUCKDB_EXTENSION_API const char *raster_version() {
+  return duckdb::DuckDB::LibraryVersion();
+}
+
 } // extern "C"
