@@ -1,5 +1,5 @@
 #include "duckdb.hpp"
-#include "duckdb/function/scalar_function"
+#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
