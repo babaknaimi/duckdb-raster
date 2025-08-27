@@ -1,4 +1,5 @@
 name: Build & package raster
+
 on:
   push:
     branches: [main]
@@ -6,34 +7,31 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Cancel in-progress runs on the same branch/PR
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
 
 jobs:
-  duckdb-next-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
-    if: false   # extension-template is currently not compatible with main
-    with:
-      duckdb_version: main
-      ci_tools_version: main
-      extension_name: raster
-
+  # Build binaries against the latest stable DuckDB release
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
+      # Pin both the DuckDB version and the CI tools version to the same tag
       duckdb_version: main
       ci_tools_version: main
+      # Name of your extension (must match the directory name and extension_config.cmake)
       extension_name: raster
+      # Disable the MingW cross-build on Windows (optional)
       exclude_archs: 'windows_amd64_mingw'
 
+  # Optional: run clang-format and clang-tidy checks
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.3.2
+      duckdb_version: main
       ci_tools_version: main
       extension_name: raster
+      # Space-separated list of checks to run
       format_checks: 'format;tidy'
-      
