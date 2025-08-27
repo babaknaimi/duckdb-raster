@@ -1,89 +1,39 @@
-name: Build & Package raster
-
+name: Build & package raster
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
 jobs:
-  build-package:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Adjust triplets to match vcpkg targets
-          - os: ubuntu-22.04
-            triplet: x64-linux-dynamic
-          - os: macos-14
-            triplet: arm64-osx-dynamic
-          - os: windows-2022
-            triplet: x64-windows-dynamic
+  duckdb-next-build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    if: false   # extension-template is currently not compatible with main
+    with:
+      duckdb_version: main
+      ci_tools_version: main
+      extension_name: raster
 
-    steps:
-      - name: Checkout repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+  duckdb-stable-build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.3.2
+    with:
+      duckdb_version: v1.3.2
+      ci_tools_version: v1.3.2
+      extension_name: raster
+      exclude_archs: 'windows_amd64_mingw'
 
-      # Install build tools on each platform
-      - name: Install build tools (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build build-essential patchelf
-
-      - name: Install build tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ninja
-
-      - name: Install build tools (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # Bootstrap vcpkg and enable manifest mode
-      - name: Bootstrap vcpkg
-        run: |
-          git clone https://github.com/microsoft/vcpkg.git
-          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
-        shell: bash
-
-      # Configure and build the extension
-      - name: Configure & build
-        run: |
-          # Enable vcpkg manifest mode so vcpkg.json is used
-          export VCPKG_FEATURE_FLAGS=manifests
-          cmake -G Ninja \
-            -S ./duckdb \
-            -B build/release \
-            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
-            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" \
-            -DEXTENSION_STATIC_BUILD=0
-          cmake --build build/release --target raster_loadable_extension
-        shell: bash
-
-      # Package the built extension (you already have platform‑specific scripts)
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          chmod +x scripts/pack_macos.sh
-          scripts/pack_macos.sh
-
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          chmod +x scripts/pack_linux.sh
-          scripts/pack_linux.sh
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          ./scripts/pack_windows.ps1
-
-      # Upload the packaged artefacts
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: raster-${{ matrix.os }}-${{ matrix.triplet }}
-          path: dist/**
+  code-quality-check:
+    name: Code Quality Check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
+    with:
+      duckdb_version: v1.3.2
+      ci_tools_version: main
+      extension_name: raster
+      format_checks: 'format;tidy'
+      

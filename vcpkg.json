@@ -2,6 +2,6 @@
         "name": "duckdb-raster",
         "version-string": "0.1.0",
         "dependencies": [
-          { "name": "gdal", "default-features": true}
+          { "name": "gdal", "default-features": false}
         ]
 }
