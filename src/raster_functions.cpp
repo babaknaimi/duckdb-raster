@@ -19,8 +19,6 @@ using namespace duckdb;
 
 namespace {
 
-
-
 // raster_width(path) -> BIGINT
 static void RasterWidthFunction(DataChunk &input, ExpressionState &state,
                                 Vector &result) {
