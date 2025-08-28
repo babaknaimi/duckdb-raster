@@ -2,6 +2,7 @@
 #include "duckdb/main/extension_util.hpp"
 #include "duckdb/common/types/validity_mask.hpp"
 #include "raster_register.hpp"
+#include "raster_gdal.hpp" 
 
 #include <algorithm>
 #include <limits>
@@ -25,6 +26,13 @@ using namespace duckdb;
 
 namespace {
 
+
+struct GDALDatasetDeleter {
+  void operator()(GDALDataset *p) const { if (p) GDALClose(p); }
+};
+using GDALDatasetPtr = std::unique_ptr<GDALDataset, GDALDatasetDeleter>;
+
+
 struct BindData : public FunctionData {
   std::string path;
   // one or many bands
@@ -43,7 +51,7 @@ struct BindData : public FunctionData {
 
 struct GlobalState : public GlobalTableFunctionState {
   // GDAL handles
-  std::unique_ptr<GDALDataset> ds;
+  GDALDatasetPtr ds;
   // parsed in Init
   int64_t width = 0, height = 0;
   std::vector<int> bands;       // band numbers (1-based)
@@ -54,8 +62,8 @@ struct GlobalState : public GlobalTableFunctionState {
   // block & buffering
   int bx = 0, by = 0;
   idx_t buf_rows = 0; // rows per refill
-  idx_t buf_pos_px =
-      0; // position within current buffer in pixels (not counting bands)
+  idx_t rows_in_buf = 0;
+  idx_t buf_pos_px = 0; // position within current buffer in pixels (not counting bands)
   idx_t buf_len_px = 0; // valid pixels currently buffered
   int64_t next_row = 0; // next dataset row to read
   int64_t buf_row0 = 0; // first row contained in current buffer
@@ -243,39 +251,23 @@ static unique_ptr<FunctionData> Bind(ClientContext &,
 
   // Multi-band: fetch real band names from the dataset
   GDALAllRegister();
-  GDALDataset *raw =
-      static_cast<GDALDataset *>(GDALOpen(bd->path.c_str(), GA_ReadOnly));
-  if (!raw) {
-    throw IOException("GDALOpen failed for '%s'", bd->path.c_str());
-  }
-
-  const int band_count = raw->GetRasterCount();
-  // Validate requested bands vs. file
+  auto ds = OpenDataset(bd->path);               // RAII; throws on failure
+  
+  const int band_count = ds->GetRasterCount();
   for (auto b : bd->bands) {
     if (b > band_count) {
-      GDALClose(raw);
-      throw IOException("Requested band %d but file has only %d bands", b,
-                        band_count);
+      throw IOException("Requested band %d but file has only %d bands", b, band_count);
     }
   }
-
-  // Collect candidate names (description -> sanitize -> fallback)
+  
   std::vector<std::string> cols;
   cols.reserve(bd->bands.size());
   for (auto b : bd->bands) {
-    GDALRasterBand *rb = raw->GetRasterBand(b);
-    const char *desc = rb ? rb->GetDescription() : nullptr; // may be empty
-    std::string nm;
-    if (desc && *desc) {
-      nm = MakeSafeName(std::string(desc));
-    } else {
-      nm = "b" + std::to_string(b);
-    }
-    if (nm.empty())
-      nm = "b" + std::to_string(b);
-    cols.push_back(nm);
+    GDALRasterBand *rb = ds->GetRasterBand(b);
+    const char *desc = rb ? rb->GetDescription() : nullptr;
+    std::string nm = (desc && *desc) ? MakeSafeName(std::string(desc)) : ("b" + std::to_string(b));
+    cols.push_back(nm.empty() ? ("b" + std::to_string(b)) : nm);
   }
-  GDALClose(raw);
 
   // Ensure uniqueness (append _2, _3, ...)
   cols = MakeUniqueNames(cols);
@@ -288,78 +280,87 @@ static unique_ptr<FunctionData> Bind(ClientContext &,
 }
 
 // ---- Init: open dataset, set cache, choose buffer size
-static unique_ptr<GlobalTableFunctionState> Init(ClientContext &,
-                                                 TableFunctionInitInput &in) {
+static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &in) {
   auto &bd = in.bind_data->Cast<BindData>();
   auto st = make_uniq<GlobalState>();
-
+  
   if (bd.cache_mb > 0) {
     CPLSetConfigOption("GDAL_CACHEMAX", std::to_string(bd.cache_mb).c_str());
   }
-
+  
   GDALAllRegister();
-  GDALDataset *raw =
-      static_cast<GDALDataset *>(GDALOpen(bd.path.c_str(), GA_ReadOnly));
-  if (!raw)
+  
+  // Open once, with RAII
+  GDALDataset *raw = static_cast<GDALDataset *>(GDALOpen(bd.path.c_str(), GA_ReadOnly));
+  if (!raw) {
     throw IOException("GDALOpen failed for '%s'", bd.path.c_str());
-  st->ds.reset(raw);
-
-  st->width = raw->GetRasterXSize();
+  }
+  st->ds.reset(raw);                // take ownership
+  raw = st->ds.get();               // convenience pointer
+  
+  // Dimensions
+  st->width  = raw->GetRasterXSize();
   st->height = raw->GetRasterYSize();
-
-  // Validate bands against dataset (again, cheap)
+  
+  // Validate requested bands
   const int band_count = raw->GetRasterCount();
   st->bands = bd.bands;
-  for (auto b : st->bands)
-    if (b > band_count)
-      throw IOException("Requested band %d but file has only %d bands", b,
-                        band_count);
-
-  // per-band nodata & natural block size
+  for (auto b : st->bands) {
+    if (b < 1 || b > band_count) {
+      throw IOException("Requested band %d but file has %d bands", b, band_count);
+    }
+  }
+  
+  // Per-band nodata + block size (use first band's block size)
   st->nodata.resize(st->bands.size(), std::numeric_limits<double>::quiet_NaN());
   st->has_nodata.resize(st->bands.size(), false);
-
+  
   int bxs = 0, bys = 0;
   for (size_t i = 0; i < st->bands.size(); ++i) {
     auto *rb = raw->GetRasterBand(st->bands[i]);
     int has_nd = 0;
-    double nd = rb->GetNoDataValue(&has_nd);
-    st->nodata[i] = nd;
+    const double nd = rb->GetNoDataValue(&has_nd);
+    st->nodata[i]     = nd;
     st->has_nodata[i] = (has_nd != 0);
-    if (i == 0)
+    if (i == 0) {
       rb->GetBlockSize(&bxs, &bys);
+    }
   }
   st->bx = bxs > 0 ? bxs : (int)st->width;
   st->by = bys > 0 ? bys : 1;
-
-  // choose rows per refill so that (width * rows * bands * 8) ~= target_mb MiB
+  
+  // Choose rows per refill so (width * rows * bands * 8 bytes) ~= target_mb MiB
   const idx_t bytes_budget = (idx_t)bd.target_mb * 1024ull * 1024ull;
-  const idx_t denom =
-      (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
+  const idx_t denom        = (idx_t)st->width * (idx_t)st->bands.size() * (idx_t)sizeof(double);
   idx_t rows = std::max<idx_t>(1, bytes_budget / std::max<idx_t>(denom, 1));
-  rows = RoundUp(rows, (idx_t)std::max<int>(1, st->by));
+  rows = RoundUp(rows, (idx_t)std::max(1, st->by));
   rows = std::min<idx_t>(rows, (idx_t)st->height);
-
-  // allocate buffer (one plane per band)
-  st->buf_rows = rows;
+  
+  // Allocate buffer (band-sequential planes)
+  st->buf_rows    = rows;
+  st->rows_in_buf = 0;
   const idx_t plane_px = (idx_t)st->width * st->buf_rows;
   const idx_t total_px = plane_px * (idx_t)st->bands.size();
   st->buf.assign((size_t)total_px, 0.0);
-
-  // band map (GDAL wants int*)
+  
+  // Band map for GDALDataset::RasterIO (expects int*)
   st->band_map.resize(st->bands.size());
-  for (size_t i = 0; i < st->bands.size(); ++i)
-    st->band_map[i] = st->bands[i];
-
+  for (size_t i = 0; i < st->bands.size(); ++i) st->band_map[i] = st->bands[i];
+  
+  // Scan cursor
   st->buf_pos_px = 0;
   st->buf_len_px = 0;
-  st->next_row = 0;
-  st->buf_row0 = 0;
+  st->next_row   = 0;
+  st->buf_row0   = 0;
+  
   return std::move(st);
 }
 
+
 // ---- Refill: one multi-band RasterIO into band-sequential planes
 static void Refill(GlobalState &st) {
+  
+  
   if (st.next_row >= st.height) {
     st.buf_len_px = 0;
     return;
@@ -389,11 +390,12 @@ static void Refill(GlobalState &st) {
     throw IOException("RasterIO failed at row %lld", (long long)st.next_row);
   }
 
+  st.rows_in_buf = (idx_t)rows_to_read;
   st.buf_row0 = st.next_row;
   st.next_row += rows_to_read;
   st.buf_pos_px = 0;
-  st.buf_len_px =
-      (idx_t)((int64_t)st.width * rows_to_read); // in pixels (per band)
+  st.buf_len_px = (idx_t)((int64_t)st.width * rows_to_read);
+  
 }
 
 // ---- Scan: emit up to STANDARD_VECTOR_SIZE rows
@@ -437,7 +439,7 @@ static void Scan(ClientContext &, TableFunctionInput &in, DataChunk &out) {
       }
     }
   } else {
-    const idx_t plane_size = (idx_t)st.width * st.buf_rows; // in pixels
+    const idx_t plane_size = (idx_t)st.width * st.rows_in_buf;
     for (size_t j = 0; j < nBands; ++j) {
       auto *col = FlatVector::GetData<double>(out.data[1 + j]);
       auto &vbit = FlatVector::Validity(out.data[1 + j]);

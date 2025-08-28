@@ -9,6 +9,7 @@
 
 #include "raster_register.hpp"
 #include "raster_functions.hpp"
+#include "raster_gdal.hpp"
 
 #include "gdal_priv.h"
 
@@ -18,17 +19,7 @@ using namespace duckdb;
 
 namespace {
 
-// Helper to open a GDAL dataset given a path.  Returns a unique_ptr
-// managing the dataset, or throws a IOException if opening fails.
-static std::unique_ptr<GDALDataset> OpenDataset(const std::string &path) {
-  GDALAllRegister();
-  GDALDataset *raw =
-      static_cast<GDALDataset *>(GDALOpen(path.c_str(), GA_ReadOnly));
-  if (!raw) {
-    throw IOException("GDALOpen failed for '%s'", path.c_str());
-  }
-  return std::unique_ptr<GDALDataset>(raw);
-}
+
 
 // raster_width(path) -> BIGINT
 static void RasterWidthFunction(DataChunk &input, ExpressionState &state,
@@ -448,7 +439,7 @@ struct CubeBindData : public FunctionData {
 };
 
 struct CubeGlobalState : public GlobalTableFunctionState {
-  std::vector<std::unique_ptr<GDALDataset>> ds;
+  std::vector<GDALDatasetPtr> ds;
   idx_t width = 0;
   idx_t height = 0;
   idx_t dataset_index = 0; // which dataset we are currently scanning
